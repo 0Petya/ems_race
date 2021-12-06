@@ -27,6 +27,22 @@ ems <- read_csv("../../data/interim/EMS_Incident_Dispatch_Data_fuzzy_2019.csv") 
   filter(INCIDENT_DATETIME >= as.Date("2019-01-01") & INCIDENT_DATETIME < as.Date("2020-01-01"))
 ```
 
+If for any reason the response time is not populated, we can't use that data.
+
+```{r}
+ems <- filter(ems, !is.na(INCIDENT_RESPONSE_SECONDS_QY))
+```
+
+```{r}
+summary(ems$INCIDENT_RESPONSE_SECONDS_QY)
+```
+
+That's quite the range in response time, some people are waiting for several hours. Additionaly, we don't want any response times of 0 seconds, that makes no sense.
+
+```{r}
+ems <- filter(ems, INCIDENT_RESPONSE_SECONDS_QY > 0)
+```
+
 ```{r}
 colnames(ems)
 ```
@@ -82,7 +98,8 @@ census_ratios <- data.frame(zip = census$zip, white = census$total_not_hispanic_
 ```
 
 ```{r}
-ems <- inner_join(ems, census_ratios, by = c("ZIPCODE" = "zip"))
+ems <- inner_join(ems, census_ratios, by = c("ZIPCODE" = "zip")) %>%
+  mutate(majority_white = white >= 0.5)
 ```
 
 # Processing zip code data
@@ -157,5 +174,7 @@ Ok, now we can use that data for modelling.
 ```{r}
 dir.create("../../data/processed/", showWarnings = F)
 write_rds(ems, "../../data/processed/ems.rds")
+write_csv(ems, "../../data/processed/ems.csv")
 write_rds(ems_traffic, "../../data/processed/ems_traffic.rds")
+write_csv(ems_traffic, "../../data/processed/ems_traffic.csv")
 ```
