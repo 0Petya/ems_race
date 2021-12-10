@@ -137,6 +137,27 @@ st_crs(traffic) <- 2263
 traffic <- st_transform(traffic, st_crs(zips))
 ```
 
+We will also save the distinct recorders to a shapefile.
+
+```{r}
+distinct_segment_ids <- rep(F, length(unique(traffic$SegmentID)))
+names(distinct_segment_ids) = unique(traffic$SegmentID)
+
+distinct_segment_indicies <- apply(traffic, 1, function(row) {
+  if (all(distinct_segment_ids)) return(F)
+  
+  if (!distinct_segment_ids[[toString(row$SegmentID)]]) {
+    distinct_segment_ids[[toString(row$SegmentID)]] <<- T
+    return(T)
+  } else return(F)
+})
+
+dir.create("../../data/processed/recorders/", showWarnings = F)
+traffic[distinct_segment_indicies,] %>%
+  select(Boro, SegmentID, street, fromSt, toSt, Direction) %>%
+  st_write("../../data/processed/recorders/recorders.shp", append = F)
+```
+
 ```{r}
 system.time(traffic <- st_drop_geometry(st_join(zips, traffic, left = F)))
 ```
@@ -172,7 +193,6 @@ That's a whole order of magnitude smaller. We'll keep the full EMS dataset and m
 Ok, now we can use that data for modelling.
 
 ```{r}
-dir.create("../../data/processed/", showWarnings = F)
 write_rds(ems, "../../data/processed/ems.rds")
 write_csv(ems, "../../data/processed/ems.csv")
 write_rds(ems_traffic, "../../data/processed/ems_traffic.rds")
