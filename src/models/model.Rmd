@@ -1,0 +1,172 @@
+---
+title: "Modelling"
+author: "Peter Tran"
+output: html_document
+---
+
+```{r}
+library(survival)
+library(survminer)
+library(tidyverse)
+```
+
+This assumes we've already processed the data in `../data/process.Rmd`.
+
+```{r}
+ems_traffic <- read_rds("../../data/processed/ems_traffic.rds")
+```
+
+# Kaplan-Meier survival curves
+
+Let's start by seeing if there's a difference in survival times between majority white and non majority white areas through the survival curves.
+
+```{r}
+s <- survfit(Surv(INCIDENT_RESPONSE_SECONDS_QY) ~ majority_white, data = ems_traffic)
+s
+```
+
+```{r}
+ggsurvplot(s, pval = T, legend.labs = c("< 50% White", ">= 50% White"), legend.title = "Race", title = "Kaplan-Meier curve for EMS arrival time")
+```
+
+It definitely looks like there's a difference, and the log-rank test confirms it. Additionally, looking at the median survival time, it looks like white patients can expect a 1 minute sooner response time. Let's take a look at only response times that were less than an hour to see it better.
+
+```{r}
+survfit(Surv(INCIDENT_RESPONSE_SECONDS_QY) ~ majority_white, data = ems_traffic %>% filter(INCIDENT_RESPONSE_SECONDS_QY < 3600)) %>%
+  ggsurvplot(pval = T, legend.labs = c("< 50% White", ">= 50% White"), legend.title = "Race", title = "Kaplan-Meier curve for EMS arrival time < 1 hour")
+```
+
+Yeah it is much more pronounced here. It looks like around the hour mark the difference disappears. Of course this could be confounded by a whole host of factors that the Kaplan-Meier curve doesn't take into account. We'll need to do a more sophisticated model to tease that.
+
+# Cox proportional hazards model
+
+```{r}
+model <- coxph(Surv(INCIDENT_RESPONSE_SECONDS_QY) ~ majority_white + INITIAL_SEVERITY_LEVEL_CODE + HELD_INDICATOR + REOPEN_INDICATOR + SPECIAL_EVENT_INDICATOR + STANDBY_INDICATOR + TRANSFER_INDICATOR + traffic, data = ems_traffic)
+model
+```
+
+According to our Cox model, if you live in a non-majority white zip code you can expect to have EMS arrive about 1.28 times longer than they would take in majority white zip codes. Granted most EMS arrival times are under 10 minutes in this dataset, therefore this amounts to a 1 or 2 minute longer wait, which is certainly not nothing.
+
+We do need to check our model for the PH assumption though.
+
+```{r}
+cox.zph(model)
+```
+
+Looks like most of our variables fail to meet the assumption pretty spectacularly, but remember that we have an obscene amount of observations so of course we will find plenty of evidence to reject the null. Since most of our variables are categorical, we can use log-minus-log plots to check them. For `traffic`, we can plot the Schoenfeld residuals.
+
+```{r}
+survfit(Surv(INCIDENT_RESPONSE_SECONDS_QY) ~ majority_white, data = ems_traffic) %>%
+  ggsurvplot(fun = "cloglog")
+```
+
+```{r}
+survfit(Surv(INCIDENT_RESPONSE_SECONDS_QY) ~ INITIAL_SEVERITY_LEVEL_CODE, data = ems_traffic) %>%
+  ggsurvplot(fun = "cloglog")
+```
+```{r}
+survfit(Surv(INCIDENT_RESPONSE_SECONDS_QY) ~ HELD_INDICATOR, data = ems_traffic) %>%
+  ggsurvplot(fun = "cloglog")
+```
+```{r}
+survfit(Surv(INCIDENT_RESPONSE_SECONDS_QY) ~ REOPEN_INDICATOR, data = ems_traffic) %>%
+  ggsurvplot(fun = "cloglog")
+```
+```{r}
+survfit(Surv(INCIDENT_RESPONSE_SECONDS_QY) ~ SPECIAL_EVENT_INDICATOR, data = ems_traffic) %>%
+  ggsurvplot(fun = "cloglog")
+```
+```{r}
+survfit(Surv(INCIDENT_RESPONSE_SECONDS_QY) ~ STANDBY_INDICATOR, data = ems_traffic) %>%
+  ggsurvplot(fun = "cloglog")
+```
+```{r}
+survfit(Surv(INCIDENT_RESPONSE_SECONDS_QY) ~ TRANSFER_INDICATOR, data = ems_traffic) %>%
+  ggsurvplot(fun = "cloglog")
+```
+```{r}
+plot(cox.zph(model), var = 8, col = "red")
+abline(h = coef(model)[8], col = "blue")
+```
+
+It looks like the PH assumption is not met for most of our categorical variables. Since we aren't actually interested in their effects, we just want to control for them, we can simply stratify our model on them.
+
+You could argue that the assumption is not met for `majority_white` and `HELD_INDICATOR`, but it's proportional for most of the time and doesn't start to converge till near the end. I believe this is still useful as the vast majority of EMS arrival times are fairly fast and we are concerned about the disparities in that time frame in particular.
+
+```{r}
+model2 <- coxph(Surv(INCIDENT_RESPONSE_SECONDS_QY) ~ majority_white + HELD_INDICATOR + traffic + strata(INITIAL_SEVERITY_LEVEL_CODE, REOPEN_INDICATOR, SPECIAL_EVENT_INDICATOR, STANDBY_INDICATOR, TRANSFER_INDICATOR), data = ems_traffic)
+model2
+```
+
+This increases our HR for `majority_white` to 1.29.
+
+# Predictions based on white proportion for mapping
+
+```{r}
+library(sf)
+library(tigris)
+
+options(tigris_use_cache = T)
+```
+
+Now that we know what the differential is between majority white and non-majority white zip codes and their EMS arrival times, we also want to create some visualizations of this. One in particular is to map the "survival" times of each zip code based on their white proportion. To do this, we'll fit another Cox model but this time using the proportion of white population as a continuous variable.
+
+Once we have that, we can get Cox-adjusted KM survival estimates.
+
+```{r}
+model3 <- coxph(Surv(INCIDENT_RESPONSE_SECONDS_QY) ~ white_proportion + HELD_INDICATOR + traffic + strata(INITIAL_SEVERITY_LEVEL_CODE, REOPEN_INDICATOR, SPECIAL_EVENT_INDICATOR, STANDBY_INDICATOR, TRANSFER_INDICATOR), data = ems_traffic %>% mutate(white_proportion = white * 100))
+model3
+```
+
+Of course, we have to check for the PH assumption with our new `white_proportion` variable.
+
+```{r}
+cox.zph(model3)
+```
+
+```{r}
+plot(cox.zph(model3), var = 1, col = "red", ylim = c(-0.15, 0.15))
+abline(h = coef(model3)[1], col = "blue")
+```
+
+Looks like it meets the PH assumption fairly well.
+
+Now we can generate the KM estimates. To do so, we'll generate an estimate for each percentage of white proportion by integer from 0% to 100%. For our other variables to adjust, we'll use their respective modes and medians.
+
+```{r}
+mode <- function(x) {
+  ux <- unique(x)
+  return(ux[which.max(tabulate(match(x, ux)))])
+}
+
+white_data <- data.frame(white_proportion = seq(0, 100, 1), HELD_INDICATOR = mode(ems_traffic$HELD_INDICATOR), traffic = median(ems_traffic$traffic), INITIAL_SEVERITY_LEVEL_CODE = median(ems_traffic$INITIAL_SEVERITY_LEVEL_CODE), REOPEN_INDICATOR = mode(ems_traffic$REOPEN_INDICATOR), SPECIAL_EVENT_INDICATOR = mode(ems_traffic$SPECIAL_EVENT_INDICATOR), STANDBY_INDICATOR = mode(ems_traffic$STANDBY_INDICATOR), TRANSFER_INDICATOR = mode(ems_traffic$TRANSFER_INDICATOR))
+```
+
+```{r}
+white_pred <- survfit(model3, newdata = white_data)
+white_pred
+```
+
+Great, now we can assign that KM estimate to each zip code by rounding the white proportion of each observation and then joining with the KM estimates above, then grouping by zip code.
+
+```{r}
+survival_pred_lookup <- data.frame(white_proportion = seq(0, 100, 1), survival_pred = surv_median(white_pred)$median)
+ems_traffic_pred <- ems_traffic %>%
+  mutate(white_proportion = round(white * 100)) %>%
+  inner_join(survival_pred_lookup, by = "white_proportion") %>%
+  group_by(ZIPCODE, white_proportion) %>%
+  summarize(mean_survival_pred = mean(survival_pred), median_survival = median(INCIDENT_RESPONSE_SECONDS_QY), median_traffic = median(traffic))
+```
+
+Now we can incorporate zip code geometry and write it to a shapefile for mapping.
+
+```{r}
+zips <- zctas() %>%
+  mutate(ZCTA5CE10 = as.numeric(ZCTA5CE10)) %>%
+  filter(ZCTA5CE10 %in% ems_traffic_pred$ZIPCODE) %>%
+  select(ZCTA5CE10)
+
+ems_traffic_pred <- merge(zips, ems_traffic_pred, by.x = "ZCTA5CE10", by.y = "ZIPCODE")
+dir.create("../../data/processed/ems_traffic_pred/", showWarnings = F)
+st_write(ems_traffic_pred, "../../data/processed/ems_traffic_pred/ems_traffic_pred.shp", append = F)
+```
