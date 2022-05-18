@@ -1,0 +1,245 @@
+---
+title: "Spatial Modeling"
+author: "Peter Tran"
+output: html_document
+---
+
+```{r, message = F}
+library(INLA)
+library(muhaz)
+library(spdep)
+library(survival)
+library(survminer)
+library(tidyverse)
+library(tigris)
+library(tmap)
+```
+
+```{r}
+options(tigris_use_cache = T)
+set.seed(05032022)
+```
+
+# Reading in data and examining distributions of variables
+
+Re-scaling time to be in minutes as some likelihoods in INLA are affected by numerical overflow when observed times are large.
+
+```{r}
+ems_traffic <- read_rds("../../data/processed/ems_traffic.rds") %>%
+  mutate(minutes = round(INCIDENT_RESPONSE_SECONDS_QY / 60, 2))
+```
+
+```{r}
+ems_traffic %>%
+  group_by(INITIAL_SEVERITY_LEVEL_CODE) %>%
+  dplyr::summarize(count = n()) %>%
+  mutate(proportion = round(count / sum(count), 2))
+```
+
+```{r}
+ems_traffic %>%
+  group_by(HELD_INDICATOR) %>%
+  dplyr::summarize(count = n()) %>%
+  mutate(proportion = count / sum(count))
+```
+
+```{r}
+ems_traffic %>%
+  group_by(REOPEN_INDICATOR) %>%
+  dplyr::summarize(count = n()) %>%
+  mutate(proportion = count / sum(count))
+```
+
+```{r}
+ems_traffic %>%
+  group_by(SPECIAL_EVENT_INDICATOR) %>%
+  dplyr::summarize(count = n()) %>%
+  mutate(proportion = round(count / sum(count), 2))
+```
+
+```{r}
+ems_traffic %>%
+  group_by(STANDBY_INDICATOR) %>%
+  dplyr::summarize(count = n()) %>%
+  mutate(proportion = count / sum(count))
+```
+
+```{r}
+ems_traffic %>%
+  group_by(TRANSFER_INDICATOR) %>%
+  dplyr::summarize(count = n()) %>%
+  mutate(proportion = round(count / sum(count), 2))
+```
+
+```{r}
+ems_traffic %>%
+  group_by(majority_white) %>%
+  dplyr::summarize(count = n()) %>%
+  mutate(proportion = count / sum(count))
+```
+
+```{r}
+summary(ems_traffic$minutes)
+```
+
+# Getting shapefiles for zip codes for construction of neighbor matrix
+
+```{r}
+zips <- zctas(cb = T, year = 2019) %>%
+  mutate(ZCTA5CE10 = as.numeric(ZCTA5CE10)) %>%
+  filter(ZCTA5CE10 %in% ems_traffic$ZIPCODE)
+
+poly2nb(zips)
+```
+
+```{r}
+zips_linked <- zips %>%
+  filter(ZCTA5CE10 != 11691)
+
+ems_traffic_linked <- ems_traffic %>%
+  mutate(ZIP_ID = match(ems_traffic$ZIPCODE, zips_linked$ZCTA5CE10)) %>%
+  filter(ZIPCODE != 11691)
+
+zips_g <- zips_linked %>%
+  poly2nb() %>%
+  nb2mat() %>%
+  inla.read.graph()
+```
+
+# EDA
+
+```{r}
+ems_median_arrival <- ems_traffic_linked %>%
+  group_by(ZIPCODE, ZIP_ID) %>%
+  dplyr::summarize(median_minutes = median(minutes))
+
+moran.mc(arrange(ems_median_arrival, ZIP_ID)$median_minutes, nb2listw(poly2nb(zips_linked)), 100000)
+```
+
+```{r}
+ems_median_arrival_map <- ems_median_arrival %>%
+  inner_join(zips_linked, by = c("ZIPCODE" = "ZCTA5CE10")) %>%
+  st_as_sf() %>%
+  tm_shape() +
+  tm_polygons("median_minutes", n = 6, style = "jenks", title = "Median minutes of EMS arrival time") +
+  tm_credits("Moran's I: ~0.18\np-value: ~0.001")
+tmap_save(ems_median_arrival_map, "../../figures/ems_median_arrival_map.png")
+ems_median_arrival_map
+```
+
+# Modeling
+
+```{r}
+survfit(Surv(minutes) ~ majority_white, data = ems_traffic %>% filter(minutes < 60)) %>%
+  ggsurvplot(pval = T, legend.labs = c("< 50% White", ">= 50% White"), legend.title = "Race", title = "Kaplan-Meier curve for EMS arrival time < 1 hour")
+ggsave("../../figures/km_est_by_majority_white.png")
+```
+
+```{r}
+ems_hazard_est <- muhaz(ems_traffic_linked$minutes)
+data.frame(minutes = ems_hazard_est$est.grid, hazard_est = ems_hazard_est$haz.est) %>%
+  ggplot(aes(x = minutes, y = hazard_est)) +
+  geom_line() +
+  xlab("Minutes") +
+  ylab("Hazard KDE")
+ggsave("../../figures/hazard_kde.png")
+```
+
+```{r}
+formula_weibull <- inla.surv(minutes) ~ majority_white + INITIAL_SEVERITY_LEVEL_CODE + HELD_INDICATOR + traffic + f(ZIP_ID, model = "bym", graph = zips_g)
+
+if (file.exists("../../data/processed/model_weibull.rds")) {
+  model_weibull <- read_rds("../../data/processed/model_weibull.rds")
+} else {
+  model_weibull <- inla(formula_weibull, family = "weibull.surv", data = ems_traffic_linked, control.compute = list(config = TRUE))
+  write_rds(model_weibull, "../../data/processed/model_weibull.rds")
+}
+```
+
+```{r}
+summary(model_weibull)
+```
+```{r}
+t(sapply(model_weibull$names.fixed, function(x) inla.zmarginal(inla.tmarginal(exp, model_weibull$marginals.fixed[[x]]))))
+```
+
+```{r, fig.width = 10, fig.height = 5}
+data.frame(x = model_weibull$marginals.hyperpar[[1]][,"x"], y = model_weibull$marginals.hyperpar[[1]][,"y"], parameter = "alpha") %>%
+  rbind(data.frame(x = inla.tmarginal(exp, model_weibull$marginals.fixed[[2]])[,"x"], y = inla.tmarginal(exp, model_weibull$marginals.fixed[[2]])[,"y"], parameter = "majority_white")) %>%
+  ggplot(aes(x = x, y = y)) +
+  geom_line() +
+  xlab("Posterior distribution of parameter") +
+  ylab("") +
+  facet_wrap(~ parameter, scales = "free")
+ggsave("../../figures/parameter_posteriors.png")
+```
+
+```{r, fig.width = 10, fig.height = 5}
+data.frame(x = model_weibull$marginals.hyperpar[[2]][,"x"], y = model_weibull$marginals.hyperpar[[2]][,"y"], parameter = "iid") %>%
+  rbind(data.frame(x = model_weibull$marginals.hyperpar[[3]][,"x"], y = model_weibull$marginals.hyperpar[[3]][,"y"], parameter = "spatial")) %>%
+  ggplot(aes(x = x, y = y)) +
+  geom_line() +
+  xlab("Precision of parameter") +
+  ylab("") +
+  facet_wrap(~ parameter, scales = "free")
+ggsave("../../figures/hyperparameter_precisions.png")
+```
+
+```{r}
+formula_weibull_non_spatial <- inla.surv(minutes) ~ majority_white + INITIAL_SEVERITY_LEVEL_CODE + HELD_INDICATOR + traffic
+
+if (file.exists("../../data/processed/model_weibull_non_spatial.rds")) {
+  model_weibull_non_spatial <- read_rds("../../data/processed/model_weibull_non_spatial.rds")
+} else {
+  model_weibull_non_spatial <- inla(formula_weibull_non_spatial, family = "weibull.surv", data = ems_traffic_linked, control.compute = list(config = TRUE))
+  write_rds(model_weibull_non_spatial, "../../data/processed/model_weibull_non_spatial.rds")
+}
+```
+
+```{r}
+summary(model_weibull_non_spatial)
+```
+```{r}
+t(sapply(model_weibull_non_spatial$names.fixed, function(x) inla.zmarginal(inla.tmarginal(exp, model_weibull_non_spatial$marginals.fixed[[x]]))))
+```
+
+```{r}
+median_traffic <- ems_traffic_linked %>%
+  group_by(ZIPCODE, ZIP_ID) %>%
+  dplyr::summarize(median_traffic = median(traffic))
+
+moran.mc(arrange(median_traffic, ZIP_ID)$median_traffic, nb2listw(poly2nb(zips_linked)), 100000)
+```
+
+```{r}
+median_traffic_map <- median_traffic %>%
+  inner_join(zips_linked, by = c("ZIPCODE" = "ZCTA5CE10")) %>%
+  st_as_sf() %>%
+  tm_shape() +
+  tm_polygons("median_traffic", n = 6, style = "jenks", title = "Median traffic volume counts") +
+  tm_credits("Moran's I: ~0.22\np-value: ~0.001")
+tmap_save(median_traffic_map, "../../figures/median_traffic_map.png")
+median_traffic_map
+```
+
+```{r}
+white_proportion <- ems_traffic_linked %>%
+  distinct(ZIPCODE, ZIP_ID, white)
+
+unselect <- unlist(white_proportion[is.na(white_proportion$white),"ZIP_ID"])
+
+white_proportion <- drop_na(white_proportion)
+
+moran.mc(arrange(white_proportion, ZIP_ID)$white, nb2listw(poly2nb(zips_linked[-unselect,])), 100000)
+```
+
+```{r}
+white_proportion_map <- white_proportion %>%
+  inner_join(zips_linked, by = c("ZIPCODE" = "ZCTA5CE10")) %>%
+  st_as_sf() %>%
+  tm_shape() +
+  tm_polygons("white", breaks = seq(0, 1, 0.10), title = "White proportion") +
+  tm_credits("Moran's I: ~0.65\np-value: ~0.00001")
+tmap_save(white_proportion_map, "../../figures/white_proportion_map.png")
+white_proportion_map
+```
