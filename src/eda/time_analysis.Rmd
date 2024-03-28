@@ -1,0 +1,35 @@
+---
+title: "Arrival Time Analysis"
+author: "Peter Tran"
+output: html_document
+---
+
+```{r, message = F}
+library(calendR)
+library(tidyverse)
+```
+
+Read in data.
+
+```{r}
+ems_traffic <- read_rds("../../data/processed/ems_traffic.rds") %>%
+  mutate(minutes = round(INCIDENT_RESPONSE_SECONDS_QY / 60, 2)) %>%
+  mutate(hours = round(INCIDENT_RESPONSE_SECONDS_QY / 3600, 2))
+```
+
+Determine max response time for each day. Fill in missing days with NA.
+
+```{r}
+max_time_by_day <- ems_traffic %>%
+  mutate(date = as.Date(INCIDENT_DATETIME)) %>%
+  group_by(date) %>%
+  dplyr::summarize(max_time = max(hours)) %>%
+  complete(date = seq(as.Date("2019-01-01"), as.Date("2019-12-31"), by = "1 day")) %>%
+  mutate(max_time = replace_na(max_time, 0))
+```
+
+Plot a calendar heatmap.
+
+```{r, fig.width = 10, fig.height = 7}
+calendR(year = 2019, special.days = max_time_by_day$max_time, gradient = T, special.col = "red", low.col = "white", legend.pos = "right", legend.title = "Hours")
+```
